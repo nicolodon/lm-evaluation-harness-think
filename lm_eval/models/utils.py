@@ -1,7 +1,6 @@
-from __future__ import annotations
-
 import collections
 import fnmatch
+import gc
 import itertools
 import logging
 import time
@@ -9,40 +8,38 @@ from functools import wraps
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
     Literal,
-    TypeVar,
+    Optional,
+    Tuple,
+    Type,
+    Union,
 )
-from typing_extensions import TypedDict
 
-from lm_eval.utils import maybe_warn, warning_once
+import torch
+import transformers
 
 
 eval_logger = logging.getLogger(__name__)
-T = TypeVar("T")
+
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Sequence
-
-    import torch
     from PIL import Image
     from transformers import PreTrainedTokenizerBase
     from transformers.configuration_utils import PretrainedConfig
 
 
-class GenKwargs(TypedDict, total=False):
-    do_sample: bool
-    temperature: float
-    # other alias' will be converted to `max_gen_toks`.
-    max_gen_toks: int
-    until: list[str]
-    __extra_items__: Any
+def chunks(iter, n: int = 0, fn=None):
+    """
+    Divides an iterable into chunks of specified size or based on a given function.
+    Useful for batching
 
-
-def chunks(_iter, n: int = 0, fn=None):
-    """Divides an iterable into chunks of specified size or based on a given function. Useful for batching.
-
-    Args:
-    - _iter: The input iterable to be divided into chunks.
+    Parameters:
+    - iter: The input iterable to be divided into chunks.
     - n: An integer representing the size of each chunk. Default is 0.
     - fn: A function that takes the current index and the iterable as arguments and returns the size of the chunk. Default is None.
 
@@ -64,9 +61,9 @@ def chunks(_iter, n: int = 0, fn=None):
     ```
     """
     arr = []
-    for i, x in enumerate(_iter):
+    for i, x in enumerate(iter):
         arr.append(x)
-        if len(arr) == (fn(i, _iter) if fn else n):
+        if len(arr) == (fn(i, iter) if fn else n):
             yield arr
             arr = []
 
@@ -84,18 +81,19 @@ class MultiChoice:
             if len(fnmatch.filter(self.choices, value)) == 0:
                 eval_logger.info("Available tasks to choose:")
                 for choice in self.choices:
-                    eval_logger.info("  - %s", choice)
-                raise ValueError(f"'{value}' is not in task list")
+                    eval_logger.info(f"  - {choice}")
+                raise ValueError("'{}' is not in task list".format(value))
         return True
 
     def __iter__(self) -> Iterator:
-        yield from self.choices
+        for choice in self.choices:
+            yield choice
 
 
 class Grouper:
-    """Takes an array `arr` and function `fn` and returns a dictionary with keys fn(ob).
-
-    For each ob in `arr` and with values `self.arr[key]` a list of all
+    """
+    takes an array `arr` and function `fn` and returns a dictionary
+    with keys fn(ob) for each ob in `arr` and with values `self.arr[key]` a list of all
     objects in `arr` satisfying `key == fn(ob)`.
     """
 
@@ -122,7 +120,7 @@ class Grouper:
         if self._grouped:
             return self._grouped
         grouped = {}
-        for key in self.arr:
+        for key in self.arr.keys():
             # drop the index from each element of self.arr
             grouped[key] = [y[1] for y in self.arr[key]]
         self._grouped = grouped
@@ -138,8 +136,8 @@ class Grouper:
 
         assert grouped_dict.keys() == self.arr.keys()
 
-        for key in grouped_dict:
-            for (ind, _), v in zip(self.arr[key], grouped_dict[key], strict=True):
+        for key in grouped_dict.keys():
+            for (ind, _), v in zip(self.arr[key], grouped_dict[key]):
                 res[ind] = v
                 cov[ind] = True
                 # orig[ind] = _
@@ -150,8 +148,133 @@ class Grouper:
         return res
 
 
+def pad_and_concat(
+    max_length: int,
+    tensors: List[torch.Tensor],
+    padding_side: Literal["right", "left"] = "right",
+):
+    """
+    Method for padding a list of tensors given the maximum tensor
+    length in the batch. Used for batching inputs and continuations in
+    seq2seq models.
+    """
+    assert padding_side == "left" or padding_side == "right", (
+        f"Unrecognized padding type: '{padding_side}' not 'left' or 'right'"
+    )
+
+    for i, tensor in enumerate(tensors):
+        if len(tensor.shape) == 2:
+            tensor = tensor.squeeze(0)  # squeeze, in case passed [1, seq] size
+        tensor_len = tensor.shape[0]
+        if tensor_len < max_length:
+            if padding_side == "right":
+                # right-pad
+                tensors[i] = torch.cat(
+                    [
+                        tensor,  # [seq]
+                        torch.zeros(
+                            max_length - tensor_len,
+                            dtype=torch.long,
+                            device=tensor.device,
+                        ),  # [padding_length - seq]
+                    ],
+                    dim=0,
+                ).unsqueeze(0)
+            else:
+                # left-pad
+                tensors[i] = torch.cat(
+                    [
+                        torch.zeros(
+                            max_length - tensor_len,
+                            dtype=torch.long,
+                            device=tensor.device,
+                        ),  # [padding_length - seq]
+                        tensor,  # [seq]
+                    ],
+                    dim=0,
+                ).unsqueeze(0)
+        else:
+            tensors[i] = tensor.unsqueeze(0)
+
+    return torch.cat(tensors, dim=0)
+
+
+def clear_torch_cache() -> None:
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def get_dtype(dtype: Union[str, torch.dtype]) -> torch.dtype:
+    """Converts `dtype` from `str` to torch.dtype when possible. Does not use an instantiated HF AutoConfig"""
+    if isinstance(dtype, str) and dtype != "auto":
+        # Convert `str` args torch dtype: `float16` -> `torch.float16`
+        _torch_dtype = getattr(torch, dtype)
+    else:
+        _torch_dtype = dtype
+    return _torch_dtype
+
+
+class MultiTokenEOSCriteria(transformers.StoppingCriteria):
+    """Criteria to stop on the specified multi-token sequence."""
+
+    def __init__(
+        self,
+        sequence: str,
+        tokenizer: transformers.PreTrainedTokenizer,
+        initial_decoder_input_length: int,
+        batch_size: int,
+    ) -> None:
+        self.initial_decoder_input_length = initial_decoder_input_length
+        self.done_tracker = [False] * batch_size
+        self.sequence = sequence
+        self.sequence_ids = tokenizer.encode(sequence, add_special_tokens=False)
+        # print(sequence, self.sequence_ids)
+        # we look back for 2 more tokens than it takes to encode our stop sequence
+        # because tokenizers suck, and a model might generate `['\n', '\n']` but our `sequence` is `['\n\n']`
+        # and we don't want to mistakenly not stop a generation because our
+        # (string) stop sequence was output in a different tokenization
+
+        # NOTE: there is a minor danger that this will end up looking back 2 tokens into the past, into the inputs to the model,
+        # and stopping generation immediately as a result. With only 2 extra tokens of lookback, this risk is minimized
+        # Additionally, in lookback_ids_batch we should prevent ever looking back into the inputs as described.
+        self.sequence_id_len = len(self.sequence_ids) + 2
+        self.tokenizer = tokenizer
+
+    def __call__(self, input_ids, scores, **kwargs) -> bool:
+        # For efficiency, we compare the last n tokens where n is the number of tokens in the stop_sequence
+        lookback_ids_batch = input_ids[:, self.initial_decoder_input_length :]
+
+        lookback_ids_batch = lookback_ids_batch[:, -self.sequence_id_len :]
+
+        lookback_tokens_batch = self.tokenizer.batch_decode(lookback_ids_batch)
+
+        for i, done in enumerate(self.done_tracker):
+            if not done:
+                self.done_tracker[i] = self.sequence in lookback_tokens_batch[i]
+        return False not in self.done_tracker
+
+
+def stop_sequences_criteria(
+    tokenizer: transformers.PreTrainedTokenizer,
+    stop_sequences: List[str],
+    initial_decoder_input_length: int,
+    batch_size: int,
+) -> transformers.StoppingCriteriaList:
+    return transformers.StoppingCriteriaList(
+        [
+            *[
+                MultiTokenEOSCriteria(
+                    sequence, tokenizer, initial_decoder_input_length, batch_size
+                )
+                for sequence in stop_sequences
+            ],
+        ]
+    )
+
+
 def undistribute(iterable):
-    """Undoes https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.distribute .
+    """
+    Undoes https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.distribute .
 
     Re-interleaves results that have been split using more_itertools.distribute:
         >>> group_1, group_2 = distribute(2, [1, 2, 3, 4, 5, 6])
@@ -179,6 +302,7 @@ def undistribute(iterable):
         [1, 2, 3]
 
     """
+
     return [
         x
         for x in itertools.chain.from_iterable(
@@ -189,14 +313,13 @@ def undistribute(iterable):
 
 
 def retry_on_specific_exceptions(
-    on_exceptions: list[type[Exception]],
-    max_retries: int | None = None,
+    on_exceptions: List[Type[Exception]],
+    max_retries: Optional[int] = None,
     backoff_time: float = 3.0,
     backoff_multiplier: float = 1.5,
-    on_exception_callback: Callable[[Exception, float], Any] | None = None,
+    on_exception_callback: Optional[Callable[[Exception, float], Any]] = None,
 ):
-    """Retry on an LLM Provider's rate limit error with exponential backoff.
-
+    """Retry on an LLM Provider's rate limit error with exponential backoff
     For example, to use for OpenAI, do the following:
     ```
     from openai import RateLimitError
@@ -230,7 +353,8 @@ def retry_on_specific_exceptions(
 
 
 class Collator:
-    """A class for reordering and batching elements of an array.
+    """
+    A class for reordering and batching elements of an array.
 
     This class allows for sorting an array based on a provided sorting function, grouping elements based on a grouping function, and generating batches from the sorted and grouped data.
 
@@ -243,18 +367,18 @@ class Collator:
 
     def __init__(
         self,
-        arr: Sequence[T],
-        sort_fn: Callable[[T], Any] = lambda x: x,
-        group_fn: Callable[[T], Any] = lambda x: x[1],
-        group_by: Literal["gen_kwargs", "contexts"] | None = None,
+        arr: List,
+        sort_fn: Callable = lambda x: x,
+        group_fn: Callable = lambda x: x[1],
+        group_by: Union[Literal["gen_kwargs", "contexts"], None] = None,
     ) -> None:
         self._group_by = group_by
         # 0 indices are enumerated indices. Apply functions to original arr.
         self._sort_fn = lambda x: sort_fn(x[1])
         self._group_fn = lambda x: group_fn(x[1])
-        self._reorder_indices: list[int] = []
+        self._reorder_indices: List = []
         self._size = len(arr)
-        self._arr_with_indices: dict | tuple[tuple[int, Any], ...] = tuple(
+        self._arr_with_indices: Union[Dict, Tuple[Tuple[int, Any], ...]] = tuple(
             enumerate(arr)
         )  # [indices, (arr)]
         if self._group_by == "contexts":
@@ -274,21 +398,19 @@ class Collator:
             self._arr_with_indices, fn=self._group_fn, group_by="contexts"
         )
 
-    def get_batched(
-        self, n: int = 1, batch_fn: Callable[[int, Iterable[T]], int] | None = None
-    ) -> Iterator[T]:
-        """Generates and yields batches from the reordered array.
-
-        The method of grouping and batching depends on the parameter `group_by`.
+    def get_batched(self, n: int = 1, batch_fn: Optional[Callable] = None) -> Iterator:
+        """
+        Generates and yields batches from the reordered array. The method of grouping and batching
+        depends on the parameter `group_by`.
         If `group_by` is set to "gen_kwargs", it will batch the
         re-ordered values with same gen_kwargs for each batch.
         If `group_by` is "contexts", it caches the requests by context before batching.
-        If `group_by` is neither "gen_kwargs" nor "contexts", it yields the reordered array.
+        If `group_by` is neither "gen_kwargs" nor "contexts", it yields the reordered array
 
-        Args:
+        Parameters:
         - n (int): The size of each batch. Defaults to 1.
         - batch_fn ([Callable[[int, Iterable], int]] | None): A function to determine the size of
-          each batch. Defaults to None.
+          each batch. Optional, defaults to None.
 
         Returns:
         Iterator: An iterator over batches of reordered elements grouped as per the `group_by`
@@ -298,7 +420,10 @@ class Collator:
         List of batched elements according to the `group_by` attribute.
         """
         if self._group_by == "gen_kwargs":
-            for values in self._arr_with_indices.values():  # type: ignore
+            for (
+                key,
+                values,
+            ) in self._arr_with_indices.items():  # type: ignore
                 values = self._reorder(values)
                 batch = self.get_chunks(values, n=n, fn=batch_fn)
                 yield from batch
@@ -320,12 +445,13 @@ class Collator:
 
     def get_cache(
         self,
-        req_str: tuple[str, str],
-        cxt_toks: list[int],
-        cont_toks: list[int],
-        logits: torch.Tensor,
-    ) -> Iterator[tuple[tuple[str, str], list[int], torch.Tensor]]:
-        """Retrieves cached single-token continuations and their associated arguments, updating indices as necessary.
+        req_str: Tuple[str, str] = None,
+        cxt_toks: List[int] = None,
+        cont_toks: List[int] = None,
+        logits: torch.Tensor = None,
+    ) -> Iterator[Tuple[Tuple[str, str], List[int], torch.Tensor]]:
+        """
+        Retrieves cached single-token continuations and their associated arguments, updating indices as necessary.
 
         The behavior of this function varies depending on how the `group_by` attribute is set:
 
@@ -360,8 +486,8 @@ class Collator:
             - logits (torch.Tensor [1, seq_length, vocab_size]): The original logits (repeated cache hit times)
         """
         if self._group_by == "contexts":
-            cache_hit: list[
-                tuple[int, tuple[tuple[str, str], list[int], list[int]]]
+            cache_hit: List[
+                Tuple[int, Tuple[Tuple[str, str], List[int], List[int]]]
             ] = self._arr_with_indices.pop(tuple(cxt_toks + cont_toks[:-1]))
             if (cache_size := len(cache_hit)) == 1:
                 self._reorder_indices.extend(x[0] for x in cache_hit)
@@ -371,32 +497,35 @@ class Collator:
                 # yield each along with its corresponding args.
                 multilogits = logits.expand(cache_size, -1, -1).chunk(cache_size)
                 indices, req_str, cont_toks = zip(
-                    *[(x[0], x[1][0], x[-1][-1]) for x in cache_hit], strict=True
+                    *[(x[0], x[1][0], x[-1][-1]) for x in cache_hit]
                 )
                 self._reorder_indices.extend(indices)
-                yield from zip(req_str, cont_toks, multilogits, strict=True)
+                for c_key, cont_tok, logit in zip(req_str, cont_toks, multilogits):
+                    yield c_key, cont_tok, logit
         else:
             yield req_str, cont_toks, logits
 
-    def _reorder(self, arr: list | tuple[tuple[int, Any], ...]) -> Iterator:
-        """Reorders the elements in the array based on the sorting function.
+    def _reorder(self, arr: Union[List, Tuple[Tuple[int, Any], ...]]) -> Iterator:
+        """
+        Reorders the elements in the array based on the sorting function.
 
-        Args:
+        Parameters:
         - arr (list | tuple[tuple[int, Any], ...]]): The array or iterable to be reordered.
 
         Yields:
             Iterator
         """
         arr = sorted(arr, key=self._sort_fn)
-        if self._group_by != "contexts":
+        if not self._group_by == "contexts":
             # If grouped by contexts then indices will be set in get_cache()
             self._reorder_indices.extend([x[0] for x in arr])
         yield from [x[1] for x in arr]
 
-    def get_original(self, newarr: list) -> list:
-        """Restores the original order of elements from the reordered list.
+    def get_original(self, newarr: List) -> List:
+        """
+        Restores the original order of elements from the reordered list.
 
-        Args:
+        Parameters:
         - newarr (list): The reordered array.
 
         Returns:
@@ -405,7 +534,7 @@ class Collator:
         res = [None] * self._size
         cov = [False] * self._size
 
-        for ind, v in zip(self._reorder_indices, newarr, strict=True):
+        for ind, v in zip(self._reorder_indices, newarr):
             res[ind] = v
             cov[ind] = True
 
@@ -418,11 +547,13 @@ class Collator:
 
     @staticmethod
     def group(
-        arr: Iterable[T],
-        fn: Callable[[T], Sequence[T] | dict],
+        arr: Iterable,
+        fn: Callable,
         group_by: Literal["gen_kwargs", "contexts"] = "gen_kwargs",
     ) -> dict:
-        """Groups elements of an iterable based on a provided function.
+        """
+        Groups elements of an iterable based on a provided function.
+
 
         The `group_by` parameter determines the method of grouping.
         If `group_by` is "contexts", the elements are grouped by [context + cont][:-1].
@@ -458,13 +589,13 @@ class Collator:
         return res
 
     @staticmethod
-    def get_chunks(
-        _iter, n: int = 0, fn: Callable[[int, Iterable[T]], int] | None = None
-    ) -> Iterator[T]:
-        """Divides an iterable into chunks of specified size or based on a given function. Useful for batching.
+    def get_chunks(_iter, n: int = 0, fn=None):
+        """
+        Divides an iterable into chunks of specified size or based on a given function.
+        Useful for batching
 
-        Args:
-        - _iter: The input iterable to be divided into chunks.
+        Parameters:
+        - iter: The input iterable to be divided into chunks.
         - n: An integer representing the size of each chunk. Default is 0.
         - fn: A function that takes the current index and the iterable as arguments and returns the size of the chunk. Default is None.
 
@@ -498,10 +629,12 @@ class Collator:
 
 
 def configure_pad_token(
-    tokenizer: PreTrainedTokenizerBase,
-    model_config: PretrainedConfig | None = None,
-) -> PreTrainedTokenizerBase:
-    """This function checks if the (Hugging Face) tokenizer has a padding token and sets it if not present. Some tokenizers require special handling.
+    tokenizer: "PreTrainedTokenizerBase",
+    model_config: Optional["PretrainedConfig"] = None,
+) -> "PreTrainedTokenizerBase":
+    """
+    This function checks if the (Hugging Face) tokenizer has a padding token and sets it if not present.
+    Some tokenizers require special handling.
 
     Args:
         tokenizer: The tokenizer for which the padding token is to be handled.
@@ -513,19 +646,17 @@ def configure_pad_token(
     Raises:
         AssertionError: If the tokenizer is of type RWKVWorldTokenizer or Rwkv5Tokenizer and the padding token id is not 0.
     """
-    if getattr(tokenizer, "pad_token_id", None) is not None or getattr(
-        tokenizer, "pad_token", None
-    ):
+    if tokenizer.pad_token:
         pass
-    elif getattr(tokenizer, "unk_token", None):
+    elif tokenizer.unk_token:
         tokenizer.pad_token_id = tokenizer.unk_token_id
-    elif getattr(tokenizer, "eos_token", None):
+    elif tokenizer.eos_token:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     else:
         # handle special cases
         if model_config and getattr(model_config, "model_type", None) == "qwen":
             # Qwen's trust_remote_code tokenizer does not allow for adding special tokens
-            tokenizer.pad_token = "<|endoftext|>"  # noqa: S105
+            tokenizer.pad_token = "<|endoftext|>"
         elif (
             tokenizer.__class__.__name__ == "RWKVWorldTokenizer"
             or tokenizer.__class__.__name__ == "Rwkv5Tokenizer"
@@ -545,8 +676,7 @@ def configure_pad_token(
 def replace_placeholders(
     string: str, default_placeholder: str, image_token: str, max_images: int
 ):
-    """Utility to replace <image> placeholder tags by model-specific image tokens like <|image_pad|>.
-
+    """
     A utility function used for local multimodal models. It locates all `placeholder` string
     occurrences in the given input `string_` and replaces the first `max_count` instances with
     `replacement`, and all subsequent occurrences with the empty string.
@@ -577,9 +707,9 @@ def replace_placeholders(
     return "".join(result)
 
 
-def flatten_image_list(images: list[list]):
-    """Takes in a list of lists of images, and returns a single list of all images in order.
-
+def flatten_image_list(images: List[List]):
+    """
+    Takes in a list of lists of images, and returns a single list of all images in order.
     Used for some multimodal models like Llava-1.5 which expects this flattened-list format for its image processor.
 
     :param images: A list of lists of PIL images.
@@ -588,7 +718,9 @@ def flatten_image_list(images: list[list]):
     return [image for image_list in images for image in image_list]
 
 
-def handle_stop_sequences(until: str | list[str] | None, eos: str | None) -> list[str]:
+def handle_stop_sequences(
+    until: Union[str, List[str], None], eos: Optional[str]
+) -> List[str]:
     """Ensures that the `until` parameter is a list of stop sequences and includes the EOS token."""
     if isinstance(until, str):
         until = [until]
@@ -604,112 +736,18 @@ def handle_stop_sequences(until: str | list[str] | None, eos: str | None) -> lis
     return until
 
 
-def normalize_gen_kwargs(
-    gen_kwargs: dict,
-    default_max_gen_toks: int = 256,
-) -> GenKwargs:
-    """Normalize generation kwargs for consistent handling across model backends.
-
-    Model implementations may have different expectations for generation parameters.
-
-    Args:
-        gen_kwargs: Raw generation kwargs from the request. Expected keys include:
-            - do_sample: Whether to use sampling (vs greedy decoding) - Required
-            - until (str | list[str]): Stop sequence(s) for generation.
-            - max_gen_toks | max_new_tokens | max_tokens | max_completion_tokens: Maximum tokens to generate
-            - temperature: Sampling temperature
-            - Other backend-specific kwargs
-        default_max_gen_toks: Default max_gen_toks if not specified in gen_kwargs.
-
-    Returns:
-        A normalized dict containing:
-        - do_sample (bool): Whether to use sampling (bool)
-        - until: list[str]: List of stop sequences.
-        - max_gen_toks (int): Maximum tokens to generate (int)
-        - temperature (float): Sampling temperature (float). Note: will always be set to 0.0 if do_sample=False or do_sample is not specified.
-        - All other kwargs passed through unchanged
-
-    Notes:
-        - Accepts `max_gen_toks` and other aliases. Priority:
-          max_gen_toks > max_new_tokens > max_tokens > max_completion_tokens.
-          Output always uses `max_gen_toks`.
-        - When `do_sample=False`, temperature is set to 0.0 for greedy decoding.
-        - When temperature is 0.0 and `do_sample` is not specified, `do_sample` is set
-          to False.
-        - Model backends may further modify the returned dict as needed (e.g., vLLM
-          removes `do_sample` since it uses temperature directly).
-    """
-    import copy
-
-    kwargs = copy.deepcopy(gen_kwargs)
-
-    until = kwargs.get("until", [])
-    if not isinstance(until, list):
-        until = [until]
-
-    # Extract max_gen_toks from various aliases (priority order: max_gen_toks > max_new_tokens > max_tokens > max_completion_tokens)
-    max_token_aliases = {
-        "max_gen_toks": kwargs.pop("max_gen_toks", None),
-        "max_new_tokens": kwargs.pop("max_new_tokens", None),  # used in HF
-        "max_tokens": kwargs.pop(
-            "max_tokens", None
-        ),  # used by vllm, OpenAI API's and others
-        "max_completion_tokens": kwargs.pop(
-            "max_completion_tokens", None
-        ),  # newer OpenAI API alias
-        # note: `max_length` is also used by HF but has different semantics (prompt + generation)
-    }
-    provided = {k: v for k, v in max_token_aliases.items() if v is not None}
-
-    if len(provided) > 1:
-        warning_once(
-            eval_logger,
-            f"Multiple max token args provided: {provided}. Using first by priority (max_gen_toks > max_new_tokens > max_tokens > max_completion_tokens).",
-        )
-
-    max_gen_toks = int(next(iter(provided.values()), default_max_gen_toks))
-
-    # Handle do_sample and temperature consistently
-    do_sample: bool | None = kwargs.get("do_sample")
-    temperature: float | None = float(kwargs.get("temperature", 0.0))
-
-    match do_sample:
-        case None:
-            kwargs["do_sample"] = True if temperature > 0.0 else False  # noqa: SIM210
-        # do_sample=False -> temperature=0.0
-        case False:
-            if temperature and temperature != 0.0:
-                warning_once(
-                    eval_logger,
-                    f"{do_sample=}` but {temperature=}; setting `temperature` to 0.0 for greedy decoding. For non-greedy decoding, set `do_sample=True`.",
-                )
-            kwargs["temperature"] = 0.0
-        case True:
-            # do_sample=True -> use provided kwargs
-            if temperature == 0.0:
-                warning_once(
-                    eval_logger,
-                    f"{do_sample=}` but {temperature=}. For non-greedy sampling, set temperature > 0.0",
-                )
-
-    # Set normalized values
-    kwargs["until"] = until
-    kwargs["max_gen_toks"] = max_gen_toks
-
-    return GenKwargs(**kwargs)  # type:ignore[missing-typed-dict-key]
-
-
 def resize_image(
-    image: Image.Image,
-    width: int | None = None,
-    height: int | None = None,
-    max_dimension: int | None = None,
+    image: "Image.Image",
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    max_dimension: Optional[int] = None,
     keep_aspect_ratio: bool = True,
-    resample_filter: int | None = None,
+    resample_filter: Union[int, str] = "Image.BICUBIC",
     min_width: int = 1,
     min_height: int = 1,
-) -> Image.Image:
-    """Resizes a PIL Image object with flexible options.
+) -> "Image.Image":
+    """
+    Resizes a PIL Image object with flexible options.
 
     Args:
         image: The PIL Image object to resize.
@@ -799,116 +837,42 @@ def resize_image(
 
 
 def truncate_tokens(
-    tokens: list[int],
+    tokens: List[int],
     max_length: int,
-    side: Literal["left", "middle", "right"] = "left",
-) -> list[int]:
-    """Truncate a token list to max_length using the given strategy (left, right, or middle)."""
-    # fmt: off
-    match side:
-        case "left": return tokens[-max_length:]
-        case "right": return tokens[:max_length]
-        case "middle":
-            # Truncate the middle of the sequence
-            left_length = max_length // 2
-            right_length = max_length - left_length
-            return tokens[:left_length] + tokens[-right_length:]
-        case _: raise ValueError(f"Unknown truncation {side=}. Must be one of 'left', 'middle', or 'right'.")
-    # fmt: on
-
-
-def maybe_truncate(
-    tokens: list[int],
-    max_gen_toks: int,
-    max_model_len: int,
-    min_gen_toks: int = 1,
-    side: Literal["left", "middle", "right"] = "left",
-    shrink_gen_toks=False,
-    verbose=True,
-) -> tuple[list[int], int]:
-    """Truncates input tokens and/or reduces max_gen_toks to fit within max_model_len.
-
-    Strategy:
-        1. No truncation needed: If len(tokens) + max_gen_toks <= max_model_len, return as-is.
-        2. If shrink_gen_toks=False: Truncate context to fit max_model_len - max_gen_toks.
-        3. If shrink_gen_toks=True:
-                a. First try reducing max_gen_toks (down to min_gen_toks) to fit the context.
-                b. If context still doesn't fit, truncate context to reserve space for min_gen_toks.
-
-    Args:
-        tokens (list[int]): The input context tokens to potentially truncate.
-        max_gen_toks (int): The maximum number of tokens to generate.
-        max_model_len (int): The model's maximum context window size (prompt + generation).
-        min_gen_toks (int): Lower bound for generation tokens. Defaults to 1.
-        side (str): "left" | "right" | "middle". Defaults to "left".
-        shrink_gen_toks (bool): Whether to adjust the generation tokens count
-            to fit within the maximum length. Defaults to False.
-        verbose (bool): Whether to log warnings when truncation or adjustments occur.
-
-    Returns:
-        tuple[list[int], int]: A tuple containing:
-            - list[int]: The (possibly truncated) context tokens.
-            - int: The adjusted maximum generation token count.
-
-    Raises:
-        ValueError: when max_model_len <= min_gen_toks.
-    """
-    ctx_len = len(tokens)
-
-    # Case 1: Everything fits comfortably
-    if ctx_len + max_gen_toks <= max_model_len:
-        return tokens, max_gen_toks
-
-    warning = f"Context length ({ctx_len}) + max_gen_toks ({max_gen_toks}) = {ctx_len + max_gen_toks} exceeds model's max length ({max_model_len})"
-
-    # Case 2: Do not adjust generation tokens, just truncate prompt
-    if not shrink_gen_toks:
-        maybe_warn(f"{warning}. Truncating context from {side=}.", verbose)
-        return truncate_tokens(
-            tokens, max_model_len - max_gen_toks, side=side
-        ), max_gen_toks
-
-    # Case 3: Prompt fits, but need to reduce max_tokens
-    if (new_max := max_model_len - ctx_len) >= min_gen_toks:
-        maybe_warn(
-            f"{warning}. Reducing {max_gen_toks=} to {new_max} to fit within model context window.",
-            verbose,
-        )
-        return tokens, new_max
-
-    # Case 4: Need to truncate prompt to fit min_tokens
-    # Reserve space for min_tokens, use rest for prompt
-    if (max_ctx_len := max_model_len - min_gen_toks) <= 0:
-        raise ValueError(
-            f"Model context window ({max_model_len}) is too small to fit "
-            f"initial context len ({ctx_len}) + minimum generation len ({min_gen_toks})"
-        )
-    maybe_warn(
-        f"{warning}. Truncating context from {side=} to {max_ctx_len} tokens to reserve {min_gen_toks=} for generation.",
-        verbose,
-    )
-    return truncate_tokens(tokens, max_ctx_len, side=side), min_gen_toks
+    tokenizer: "PreTrainedTokenizerBase",
+    strategy: str = "left",
+):
+    if strategy == "left":
+        return tokens[-max_length:]
+    elif strategy == "right":
+        return tokens[:max_length]
+    elif strategy == "middle":
+        # Truncate the middle of the sequence
+        left_length = max_length // 2
+        right_length = max_length - left_length
+        return tokens[:left_length] + tokens[-right_length:]
+    return None
 
 
 def postprocess_generated_text(
-    generation: str, stop: list[str] | str | None, think_end_token: str | None
-) -> str:
-    """Post-processes the generated text by stripping stop sequences and optional thinking markers.
+    generation: str, stop: Union[list[str], str, None], think_end_token: Optional[str], think_start_token: Optional[str]) -> tuple[str, str]:
+    """
+    Post-processes the generated text by stripping stop sequences and optional thinking markers.
 
     Args:
         generation (str): The generated text to be processed.
-        stop (list[str] | None): Stop sequence(s) to remove. Text is truncated
+        stop (Optional[list[str]]): Stop sequence(s) to remove. Text is truncated
             at the first occurrence of any stop sequence.
-        think_end_token (str | None): Token marking end of thinking section. If provided,
+        think_end_token (Optional[str]): Token marking end of thinking section. If provided,
             returns only the text after this token (discarding thinking content).
+        think_start_token (Optional[str]): Token marking the start of thinking section. If provided,
+            returns only the text after this token.
 
     Returns:
-        str: The processed generation - text before stop sequences and after thinking sections.
+        tuple[str, str]: (processed_generation, cot_trace) where processed_generation is the
+            text before stop sequences and after thinking sections, and cot_trace is the
+            extracted reasoning trace (empty string if no thinking tokens were found).
     """
-    # Strip thinking content first so stop sequences apply to the response,
-    # not to the reasoning trace (which often contains \n\n etc.)
-    if think_end_token:
-        generation = generation.split(think_end_token)[-1].lstrip()
     if stop:
         stop = [stop] if isinstance(stop, str) else stop
         for term in stop:
@@ -917,21 +881,12 @@ def postprocess_generated_text(
                 # for seq2seq case where self.tok_decode(self.eot_token_id) = ''
                 generation = generation.split(term)[0]
 
-    return generation
+    cot_trace = ""
+    if think_end_token:
+        if think_start_token:
+            generation = generation.split(think_start_token)[-1].lstrip()
 
+        cot_trace = generation.split(think_end_token)[0].lstrip()
+        generation = generation.split(think_end_token)[-1].lstrip()
 
-def has_bos_prefix(sequence: str, bos_str: str | Iterable[str] | None = None) -> bool:
-    if bos_str is None:
-        return False
-    elif isinstance(bos_str, str):
-        return sequence.startswith(bos_str)
-    else:
-        return any(sequence.startswith(x) for x in bos_str)
-
-
-def _add_special_kwargs(add_special_tokens: bool | None, add_bos: bool | None = None):
-    if add_special_tokens is not None:
-        return {"add_special_tokens": add_special_tokens}
-    if add_bos is not None:
-        return {"add_special_tokens": add_bos}
-    return {}
+    return generation, cot_trace
