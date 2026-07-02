@@ -282,6 +282,12 @@ class HFLM(TemplateLM):
             else {}
         )
 
+        # Save original string forms before auto-resolution. These are needed as fallback
+        # when auto-resolve converts to integer IDs but the model generates the tokens as
+        # multi-token sequences rather than single special tokens.
+        self._think_end_token_str = self.think_end_token if isinstance(self.think_end_token, str) else None
+        self._think_start_token_str = self.think_start_token if isinstance(self.think_start_token, str) else None
+
         self.add_bos_token = add_bos_token
         if "gemma" in getattr(self.config, "model_type", ""):
             self.add_bos_token = True
@@ -1520,17 +1526,46 @@ class HFLM(TemplateLM):
                         resp_toks = cont_toks[last_think_idx + 1 :]
                         s = self.tok_decode(resp_toks).lstrip()
                     else:
-                        # No thinking block found — store the full output as COT trace
-                        cot_trace = self.tok_decode(cont_toks)
-                        s = cot_trace
-
-                    # Apply stop-sequence post-processing (no string think tokens to strip here)
-                    s, _ = postprocess_generated_text(
-                        generation=s,
-                        stop=until,
-                        think_end_token=None,
-                        think_start_token=None,
-                    )
+                        # Integer token ID not found in generated tokens.
+                        # This happens when the model generates think delimiters as
+                        # multi-token sequences rather than single special tokens.
+                        # Fall back to string-based extraction: re-decode the full
+                        # output with skip_special_tokens=False so that any special
+                        # token representation of the delimiter is preserved, then
+                        # try splitting by the original string form.
+                        end_str = getattr(self, '_think_end_token_str', None)
+                        start_str = getattr(self, '_think_start_token_str', None)
+                        full_text = self.tok_decode(cont_toks, skip_special_tokens=False)
+                        if end_str and end_str in full_text:
+                            eval_logger.debug(
+                                f"think_end_token ID not found in tokens, but string "
+                                f"'{end_str}' found in decoded text. Using string fallback."
+                            )
+                            s, cot_trace = postprocess_generated_text(
+                                generation=full_text,
+                                stop=until,
+                                think_end_token=end_str,
+                                think_start_token=start_str,
+                            )
+                        else:
+                            # No thinking block found at all — use the full output
+                            s = self.tok_decode(cont_toks)
+                            cot_trace = s
+                            # Apply stop-sequence post-processing
+                            s, _ = postprocess_generated_text(
+                                generation=s,
+                                stop=until,
+                                think_end_token=None,
+                                think_start_token=None,
+                            )
+                    # If the integer path succeeded, still apply stop-sequence post-processing
+                    if think_token_indices:
+                        s, _ = postprocess_generated_text(
+                            generation=s,
+                            stop=until,
+                            think_end_token=None,
+                            think_start_token=None,
+                        )
                 else:
                     s = self.tok_decode(cont_toks)
 
