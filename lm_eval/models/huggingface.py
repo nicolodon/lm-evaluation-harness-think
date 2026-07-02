@@ -242,17 +242,34 @@ class HFLM(TemplateLM):
             self.model.eval()
             self.model.tie_weights()
 
-        self.think_end_token = (
-            int(think_end_token)
-            if (isinstance(think_end_token, str) and think_end_token.isdigit())
-            else think_end_token
-        )
+        def _resolve_think_token(token):
+            """Convert a string think token to its integer token ID if possible.
 
-        self.think_start_token = (
-            int(think_start_token)
-            if (isinstance(think_start_token, str) and think_start_token.isdigit())
-            else think_start_token
-        )
+            Handles two cases:
+            1. Numeric string (e.g. "106") → int(token)
+            2. Special-token string (e.g. "<channel|>") → vocab lookup.
+               This is required for models like Gemma 4 whose end-of-thinking
+               marker is a special token silently stripped by tok_decode
+               (skip_special_tokens=True), making string-based splitting
+               impossible.
+            """
+            if token is None or isinstance(token, int):
+                return token
+            if isinstance(token, str) and token.isdigit():
+                return int(token)
+            # Look up in the tokenizer's added-vocab map (covers special tokens)
+            added_vocab = self.tokenizer.get_added_vocab()
+            if token in added_vocab:
+                resolved = added_vocab[token]
+                eval_logger.info(
+                    f"Auto-resolved think token '{token}' to integer ID {resolved} "
+                    f"(detected as a special token in the tokenizer vocab)."
+                )
+                return resolved
+            return token
+
+        self.think_end_token = _resolve_think_token(think_end_token)
+        self.think_start_token = _resolve_think_token(think_start_token)
 
         self.truncation = truncation
         self.logits_cache = logits_cache
