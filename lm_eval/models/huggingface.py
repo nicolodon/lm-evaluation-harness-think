@@ -285,8 +285,8 @@ class HFLM(TemplateLM):
         # Save original string forms before auto-resolution. These are needed as fallback
         # when auto-resolve converts to integer IDs but the model generates the tokens as
         # multi-token sequences rather than single special tokens.
-        self._think_end_token_str = self.think_end_token if isinstance(self.think_end_token, str) else None
-        self._think_start_token_str = self.think_start_token if isinstance(self.think_start_token, str) else None
+        self._think_end_token_str = think_end_token if isinstance(think_end_token, str) and not think_end_token.isdigit() else None
+        self._think_start_token_str = think_start_token if isinstance(think_start_token, str) and not think_start_token.isdigit() else None
 
         self.add_bos_token = add_bos_token
         if "gemma" in getattr(self.config, "model_type", ""):

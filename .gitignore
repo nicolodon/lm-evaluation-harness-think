@@ -48,3 +48,7 @@ examples/wandb/
 
 #uv
 uv.lock
+
+results_mmlu_pro/
+containers/
+lav-eval-scripts/
