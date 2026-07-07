@@ -44,7 +44,14 @@ class FilterEnsemble:
 
     def apply(self, instances: List[Instance]) -> None:
         
-        resps, docs = zip(*(([inst.resps[0][0][0]], inst.doc) for inst in instances))
+        def get_resp(resps):
+            while isinstance(resps, list) and len(resps) > 0 and isinstance(resps[0], list):
+                resps = resps[0]
+            if isinstance(resps, list) and len(resps) > 0:
+                return resps[0]
+            return resps
+
+        resps, docs = zip(*(([get_resp(inst.resps)], inst.doc) for inst in instances))
         resps, docs = list(resps), list(docs)
 
         for f in self.filters:
