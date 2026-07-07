@@ -886,7 +886,11 @@ def postprocess_generated_text(
         if think_start_token:
             generation = generation.split(think_start_token)[-1].lstrip()
 
-        cot_trace = generation.split(think_end_token)[0].lstrip()
-        generation = generation.split(think_end_token)[-1].lstrip()
+        if think_end_token in generation:
+            cot_trace = generation.split(think_end_token)[0].lstrip()
+            generation = generation.split(think_end_token)[-1].lstrip()
+        else:
+            cot_trace = generation.lstrip()
+            generation = ""
 
     return generation, cot_trace

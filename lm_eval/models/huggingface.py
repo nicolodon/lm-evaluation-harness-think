@@ -1536,10 +1536,10 @@ class HFLM(TemplateLM):
                         end_str = getattr(self, '_think_end_token_str', None)
                         start_str = getattr(self, '_think_start_token_str', None)
                         full_text = self.tok_decode(cont_toks, skip_special_tokens=False)
-                        if end_str and end_str in full_text:
+                        if end_str:
                             eval_logger.debug(
-                                f"think_end_token ID not found in tokens, but string "
-                                f"'{end_str}' found in decoded text. Using string fallback."
+                                f"think_end_token ID not found in tokens. Using string fallback "
+                                f"with '{end_str}' on decoded text."
                             )
                             s, cot_trace = postprocess_generated_text(
                                 generation=full_text,
@@ -1548,10 +1548,9 @@ class HFLM(TemplateLM):
                                 think_start_token=start_str,
                             )
                         else:
-                            # No thinking block found at all — use the full output
+                            # No string fallback available
                             s = self.tok_decode(cont_toks)
                             cot_trace = s
-                            # Apply stop-sequence post-processing
                             s, _ = postprocess_generated_text(
                                 generation=s,
                                 stop=until,
