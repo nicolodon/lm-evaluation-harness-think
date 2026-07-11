@@ -656,6 +656,17 @@ class VLLM(TemplateLM):
                     "generate_until", (_context, _gen_kwargs), s_list
                 )
                 pbar.update(1)
+                
+            # -- BACKUP SAVING (per chunk) --
+            try:
+                import json
+                with open("vllm_backup_samples.jsonl", "a", encoding="utf-8") as bf:
+                    chunk_results = res[-len(chunk):]
+                    for _ctx, _res in zip(context, chunk_results):
+                        bf.write(json.dumps({"prompt": _ctx, "response": _res}) + "\n")
+            except Exception as e:
+                eval_logger.warning(f"Failed to save backup: {e}")
+
 
         pbar.close()
         # reorder all group of results back to original unsorted form

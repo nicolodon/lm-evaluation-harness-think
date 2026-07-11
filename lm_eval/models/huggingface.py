@@ -1586,6 +1586,17 @@ class HFLM(TemplateLM):
 
                 self.cache_hook.add_partial("generate_until", (context, gen_kwargs), s_list)
                 pbar.update(1)
+                
+            # -- BACKUP SAVING (per chunk) --
+            try:
+                import json
+                with open("hf_backup_samples.jsonl", "a", encoding="utf-8") as bf:
+                    chunk_results = res[-len(chunk):]
+                    for _ctx, _res in zip(contexts, chunk_results):
+                        bf.write(json.dumps({"prompt": _ctx, "response": _res}) + "\n")
+            except Exception as e:
+                eval_logger.warning(f"Failed to save backup: {e}")
+                
         # reorder this group of results back to original unsorted form
         res = re_ords.get_original(res)
 
