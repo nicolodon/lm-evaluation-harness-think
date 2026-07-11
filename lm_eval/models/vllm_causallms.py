@@ -553,8 +553,22 @@ class VLLM(TemplateLM):
     def generate_until(
         self, requests: list[Instance], disable_tqdm: bool = False
     ) -> list[str]:
-        assert self.tokenizer
         res = []
+        
+        # --- RESUME FROM BACKUP LOGIC ---
+        backup_dict = {}
+        try:
+            import json, os
+            backup_file = os.environ.get("LM_EVAL_BACKUP_PATH", "vllm_backup_samples.jsonl")
+            if os.path.exists(backup_file):
+                with open(backup_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        data = json.loads(line)
+                        backup_dict[data["prompt"]] = data["response"]
+                eval_logger.info(f"Loaded {len(backup_dict)} cached samples from {backup_file}")
+        except Exception as e:
+            eval_logger.warning(f"Failed to load backup file: {e}")
+        assert self.tokenizer
 
         # batch tokenize contexts
         context, all_gen_kwargs = zip(*(req.args for req in requests), strict=True)
@@ -595,10 +609,18 @@ class VLLM(TemplateLM):
             context_encoding_truncated = []
             sampling_params = []
             _cache_gen_kwargs = []
-            for toks, gen_kwargs in zip(context_encoding, all_gen_kwargs, strict=True):
+            compute_indices = []
+            cached_results = {}
+            for i, (toks, gen_kwargs, ctx) in enumerate(zip(context_encoding, all_gen_kwargs, context)):
                 assert isinstance(gen_kwargs, dict), (
                     f"Expected `gen_kwargs` to be of type `dict` but got {type(gen_kwargs)}"
                 )
+
+                if ctx in backup_dict:
+                    cached_results[i] = backup_dict[ctx]
+                    continue
+                    
+                compute_indices.append(i)
 
                 kwargs, until, max_gen_toks = self.modify_gen_kwargs(
                     gen_kwargs, eos=eos, default_max_gen_toks=self.max_gen_toks
@@ -615,12 +637,6 @@ class VLLM(TemplateLM):
                 )
                 context_encoding_truncated.append(toks)
 
-                # When a reasoning model is active, task-level stop sequences
-                # (e.g. the fewshot delimiter "\n\n") should not go to vLLM —
-                # they often exist inside <think> blocks and cause it to truncate
-                # before any response is produced.  Only EOS should be passed
-                # to vLLM; task stops are applied in postprocess_generated_text
-                # after thinking content is stripped.
                 if self.think_end_token:
                     eos_only = [s for s in until if s == eos]
                     sampling_params.append(
@@ -634,38 +650,49 @@ class VLLM(TemplateLM):
                     kwargs | {"until": until, "max_gen_toks": max_gen_toks}
                 )
 
-            # perform batched generation
-            cont = self._model_generate(
-                requests=context_encoding_truncated,
-                generate=True,
-                sampling_params=sampling_params,
-            )
+            # perform batched generation ONLY on compute_indices
+            if context_encoding_truncated:
+                cont_computed = self._model_generate(
+                    requests=context_encoding_truncated,
+                    generate=True,
+                    sampling_params=sampling_params,
+                )
+            else:
+                cont_computed = []
 
-            # cache generations
-            for output, _context, _gen_kwargs in zip(
-                cont, context, _cache_gen_kwargs, strict=True
-            ):
-                generated_text: str = output.outputs[0].text
-                # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
-                generated_text, cot_trace = postprocess_generated_text(
-                    generated_text, _gen_kwargs.get("until"), self.think_end_token, think_start_token=self.think_start_token
-                )
-                s_list = [generated_text, cot_trace]
-                res.append(s_list)
-                self.cache_hook.add_partial(
-                    "generate_until", (_context, _gen_kwargs), s_list
-                )
-                pbar.update(1)
-                
-            # -- BACKUP SAVING (per chunk) --
-            try:
-                import json
-                with open("vllm_backup_samples.jsonl", "a", encoding="utf-8") as bf:
-                    chunk_results = res[-len(chunk):]
-                    for _ctx, _res in zip(context, chunk_results):
-                        bf.write(json.dumps({"prompt": _ctx, "response": _res}) + "\n")
-            except Exception as e:
-                eval_logger.warning(f"Failed to save backup: {e}")
+            # Stitch together cache and computed results
+            cont_idx = 0
+            for i in range(len(context)):
+                if i in cached_results:
+                    s_list = cached_results[i]
+                    res.append(s_list)
+                    pbar.update(1)
+                else:
+                    output = cont_computed[cont_idx]
+                    _context = context[i]
+                    _gen_kwargs = _cache_gen_kwargs[cont_idx]
+                    
+                    generated_text: str = output.outputs[0].text
+                    generated_text, cot_trace = postprocess_generated_text(
+                        generated_text, _gen_kwargs.get("until"), self.think_end_token, think_start_token=self.think_start_token
+                    )
+                    s_list = [generated_text, cot_trace]
+                    res.append(s_list)
+                    self.cache_hook.add_partial(
+                        "generate_until", (_context, _gen_kwargs), s_list
+                    )
+                    pbar.update(1)
+                    
+                    # save this specific sample to backup so we don't save everything again
+                    try:
+                        import json, os
+                        backup_file = os.environ.get("LM_EVAL_BACKUP_PATH", "vllm_backup_samples.jsonl")
+                        with open(backup_file, "a", encoding="utf-8") as bf:
+                            bf.write(json.dumps({"prompt": _context, "response": s_list}) + "\n")
+                    except Exception:
+                        pass
+                    
+                    cont_idx += 1
 
 
         pbar.close()

@@ -1400,6 +1400,21 @@ class HFLM(TemplateLM):
         self, requests: list[Instance], disable_tqdm: bool = False
     ) -> list[str]:
         res = []
+        
+        # --- RESUME FROM BACKUP LOGIC ---
+        backup_dict = {}
+        try:
+            import json, os
+            backup_file = os.environ.get("LM_EVAL_BACKUP_PATH", "hf_backup_samples.jsonl")
+            if os.path.exists(backup_file):
+                with open(backup_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        data = json.loads(line)
+                        backup_dict[data["prompt"]] = data["response"]
+                eval_logger.info(f"Loaded {len(backup_dict)} cached samples from {backup_file}")
+        except Exception as e:
+            eval_logger.warning(f"Failed to load backup file: {e}")
+
 
         def _collate(req: tuple[str, dict]):
             """Defines the key for the sorted method"""
@@ -1469,39 +1484,65 @@ class HFLM(TemplateLM):
             else:
                 max_gen_toks = self.max_gen_toks
 
-            # set the max length in tokens of inputs ("context_enc")
-            if self.backend == "causal":
-                # max len for inputs = max length, minus room to generate the max new tokens
-                max_ctx_len = self.max_length - max_gen_toks
-                assert max_ctx_len > 0, (
-                    f"Invalid configuration: requested max tokens to generate ({max_gen_toks}) must be less than model's maximum sequence length ({self.max_length})."
+            # --- FILTER OUT CACHED CONTEXTS ---
+            compute_indices = []
+            cached_results = {}
+            for i, ctx in enumerate(contexts):
+                if ctx in backup_dict:
+                    cached_results[i] = backup_dict[ctx]
+                else:
+                    compute_indices.append(i)
+                    
+            contexts_to_compute = [contexts[i] for i in compute_indices]
+
+            if contexts_to_compute:
+                # set the max length in tokens of inputs ("context_enc")
+                if self.backend == "causal":
+                    # max len for inputs = max length, minus room to generate the max new tokens
+                    max_ctx_len = self.max_length - max_gen_toks
+                    assert max_ctx_len > 0, (
+                        f"Invalid configuration: requested max tokens to generate ({max_gen_toks}) must be less than model's maximum sequence length ({self.max_length})."
+                    )
+                elif self.backend == "seq2seq":
+                    # max len for inputs = encoder's whole max_length
+                    max_ctx_len = self.max_length
+
+                # encode, pad, and truncate contexts for this batch
+                context_enc, attn_masks = self.tok_batch_encode(
+                    contexts_to_compute,
+                    left_truncate_len=max_ctx_len,
+                    truncation=self.truncation,
                 )
-            elif self.backend == "seq2seq":
-                # max len for inputs = encoder's whole max_length
-                max_ctx_len = self.max_length
+                context_enc = context_enc.to(self.device)
+                attn_masks = attn_masks.to(self.device)
 
-            # encode, pad, and truncate contexts for this batch
-            context_enc, attn_masks = self.tok_batch_encode(
-                contexts,
-                left_truncate_len=max_ctx_len,
-                truncation=self.truncation,
-            )
-            context_enc = context_enc.to(self.device)
-            attn_masks = attn_masks.to(self.device)
+                if "max_length" not in kwargs:
+                    kwargs["max_length"] = context_enc.shape[1] + max_gen_toks
 
-            if "max_length" not in kwargs:
-                kwargs["max_length"] = context_enc.shape[1] + max_gen_toks
-
-            # perform batched generation
-            cont = self._model_generate(
-                context=context_enc,
-                attention_mask=attn_masks,
-                stop=until,
-                **kwargs,
-            )
+                # perform batched generation
+                cont = self._model_generate(
+                    context=context_enc,
+                    attention_mask=attn_masks,
+                    stop=until,
+                    **kwargs,
+                )
+                
+                cont_toks_list = cont.tolist()
+            else:
+                cont_toks_list = []
+                context_enc = None
+                
+            cont_iter = iter(cont_toks_list)
             
-            cont_toks_list = cont.tolist()
-            for cont_toks, context in zip(cont_toks_list, contexts):
+            for i, context in enumerate(contexts):
+                if i in cached_results:
+                    s_list = cached_results[i]
+                    res.append(s_list)
+                    self.cache_hook.add_partial("generate_until", (context, gen_kwargs), s_list)
+                    pbar.update(1)
+                    continue
+
+                cont_toks = next(cont_iter)
                 # discard context + left-padding toks if using causal decoder-only LM
                 if self.backend == "causal":
                     cont_toks = cont_toks[context_enc.shape[1] :]
@@ -1587,15 +1628,13 @@ class HFLM(TemplateLM):
                 self.cache_hook.add_partial("generate_until", (context, gen_kwargs), s_list)
                 pbar.update(1)
                 
-            # -- BACKUP SAVING (per chunk) --
-            try:
-                import json
-                with open("hf_backup_samples.jsonl", "a", encoding="utf-8") as bf:
-                    chunk_results = res[-len(chunk):]
-                    for _ctx, _res in zip(contexts, chunk_results):
-                        bf.write(json.dumps({"prompt": _ctx, "response": _res}) + "\n")
-            except Exception as e:
-                eval_logger.warning(f"Failed to save backup: {e}")
+                try:
+                    import json, os
+                    backup_file = os.environ.get("LM_EVAL_BACKUP_PATH", "hf_backup_samples.jsonl")
+                    with open(backup_file, "a", encoding="utf-8") as bf:
+                        bf.write(json.dumps({"prompt": context, "response": s_list}) + "\n")
+                except Exception:
+                    pass
                 
         # reorder this group of results back to original unsorted form
         res = re_ords.get_original(res)
