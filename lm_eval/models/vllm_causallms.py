@@ -84,6 +84,8 @@ class VLLM(TemplateLM):
         chat_template_args: dict | None = None,
         # End marker for thinking tags - splits to get response after this token (if provided).
         think_end_token: str | None = None,
+        # Start marker for thinking tags.
+        think_start_token: str | None = None,
         max_lora_rank: int = 16,
         truncation_side: Literal["left", "right", "middle"] = "left",
         **kwargs,
@@ -110,6 +112,7 @@ class VLLM(TemplateLM):
             )
             kwargs.pop("device")
         self.think_end_token = think_end_token
+        self.think_start_token = think_start_token
         self._max_length = max_model_len if max_model_len is not None else max_length
         self.tensor_parallel_size = int(tensor_parallel_size)
         # truncation strategy for inputs exceeding max length
@@ -644,12 +647,13 @@ class VLLM(TemplateLM):
             ):
                 generated_text: str = output.outputs[0].text
                 # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
-                generated_text = postprocess_generated_text(
-                    generated_text, _gen_kwargs.get("until"), self.think_end_token
+                generated_text, cot_trace = postprocess_generated_text(
+                    generated_text, _gen_kwargs.get("until"), self.think_end_token, think_start_token=self.think_start_token
                 )
-                res.append(generated_text)
+                s_list = [generated_text, cot_trace]
+                res.append(s_list)
                 self.cache_hook.add_partial(
-                    "generate_until", (_context, _gen_kwargs), generated_text
+                    "generate_until", (_context, _gen_kwargs), s_list
                 )
                 pbar.update(1)
 
