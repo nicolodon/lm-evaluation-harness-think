@@ -1,0 +1,53 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime
+
+%post
+    # Install uv, an extremely fast Python package installer and resolver written in Rust
+    pip install --break-system-packages uv
+    
+    # Create the virtual environment using uv
+    uv venv /opt/venv
+    
+    # Temporarily activate the virtual environment for the rest of %post
+    export PATH="/opt/venv/bin:$PATH"
+    
+    # Install MXFP4 kernels (required by transformers for Hopper quantization)
+    uv pip install -U "kernels>=0.15.2,<0.16.0" "triton>=3.0.0"
+    
+    # Install comprehensive Hugging Face quantization support
+    uv pip install accelerate bitsandbytes autoawq optimum
+    
+    # Install vLLM for multi-GPU tensor parallelism
+    uv pip install vllm
+    
+    # Download lm-evaluation-harness archive safely using a python script
+    cat << 'EOF' > download.py
+import urllib.request
+urllib.request.urlretrieve('https://github.com/nicolodon/lm-evaluation-harness-think/archive/refs/heads/main.tar.gz', 'main.tar.gz')
+EOF
+    python3 download.py
+    tar -xzf main.tar.gz
+    mv lm-evaluation-harness-think-main lm-evaluation-harness
+    cd lm-evaluation-harness
+    
+    # Apply essential fixes:
+    # 1. Fix deprecated Vision2Seq architecture name
+    find lm_eval/models/ -name "*.py" -exec sed -i 's/AutoModelForVision2Seq/AutoModelForImageTextToText/g' {} +
+    
+    # 2. Disable neuron_optimum (AWS Inferentia only)
+    echo "# neuron_optimum disabled" > lm_eval/models/neuron_optimum.py
+        
+    # Install lm_eval with hf and vllm extras into the venv
+    uv pip install ".[hf]" ".[vllm]"
+
+%environment
+    # Make the virtual environment the default Python environment for anyone running the container
+    export PATH="/opt/venv/bin:$PATH"
+    
+    # Standard cache and locale settings
+    export HF_HOME=/scratch.hpc/nicolo.donati11/hf_cache
+    export LC_ALL=C
+
+%runscript
+    # Virtual environment is automatically active due to PATH. Just run the harness.
+    exec lm_eval "$@"
