@@ -894,3 +894,83 @@ def postprocess_generated_text(
             generation = ""
 
     return generation, cot_trace
+
+
+def truncate_tokens(
+    tokens: List[int],
+    max_length: int,
+    side: Literal["left", "middle", "right"] = "left",
+) -> List[int]:
+    """Truncate a token list to max_length using the given strategy (left, right, or middle)."""
+    if side == "left":
+        return tokens[-max_length:]
+    elif side == "right":
+        return tokens[:max_length]
+    elif side == "middle":
+        # Truncate the middle of the sequence
+        left_length = max_length // 2
+        right_length = max_length - left_length
+        return tokens[:left_length] + tokens[-right_length:]
+    else:
+        raise ValueError(f"Unknown truncation side={side}. Must be one of 'left', 'middle', or 'right'.")
+
+
+def maybe_truncate(
+    tokens: List[int],
+    max_gen_toks: int,
+    max_model_len: int,
+    min_gen_toks: int = 1,
+    side: Literal["left", "middle", "right"] = "left",
+    shrink_gen_toks=False,
+    verbose=True,
+) -> Tuple[List[int], int]:
+    """Truncates input tokens and/or reduces max_gen_toks to fit within max_model_len."""
+    ctx_len = len(tokens)
+
+    # Case 1: Everything fits comfortably
+    if ctx_len + max_gen_toks <= max_model_len:
+        return tokens, max_gen_toks
+
+    warning = f"Context length ({ctx_len}) + max_gen_toks ({max_gen_toks}) = {ctx_len + max_gen_toks} exceeds model's max length ({max_model_len})"
+
+    # Case 2: Do not adjust generation tokens, just truncate prompt
+    if not shrink_gen_toks:
+        if verbose:
+            eval_logger.warning(f"{warning}. Truncating context from side={side}.")
+        return truncate_tokens(tokens, max_model_len - max_gen_toks, side=side), max_gen_toks
+
+    # Case 3: Prompt fits, but need to reduce max_tokens
+    new_max = max_model_len - ctx_len
+    if new_max >= min_gen_toks:
+        if verbose:
+            eval_logger.warning(f"{warning}. Reducing max_gen_toks={max_gen_toks} to {new_max} to fit within model context window.")
+        return tokens, new_max
+
+    # Case 4: Need to truncate prompt to fit min_tokens
+    # Reserve space for min_tokens, use rest for prompt
+    max_ctx_len = max_model_len - min_gen_toks
+    if max_ctx_len <= 0:
+        raise ValueError(
+            f"Model context window ({max_model_len}) is too small to fit "
+            f"initial context len ({ctx_len}) + minimum generation len ({min_gen_toks})"
+        )
+    if verbose:
+        eval_logger.warning(f"{warning}. Truncating context from side={side} to {max_ctx_len} tokens to reserve min_gen_toks={min_gen_toks} for generation.")
+    return truncate_tokens(tokens, max_ctx_len, side=side), min_gen_toks
+
+
+def has_bos_prefix(sequence: str, bos_str: Union[str, Iterable[str], None] = None) -> bool:
+    if bos_str is None:
+        return False
+    elif isinstance(bos_str, str):
+        return sequence.startswith(bos_str)
+    else:
+        return any(sequence.startswith(x) for x in bos_str)
+
+
+def _add_special_kwargs(add_special_tokens: Optional[bool], add_bos: Optional[bool] = None) -> Dict[str, bool]:
+    if add_special_tokens is not None:
+        return {"add_special_tokens": add_special_tokens}
+    if add_bos is not None:
+        return {"add_special_tokens": add_bos}
+    return {}
