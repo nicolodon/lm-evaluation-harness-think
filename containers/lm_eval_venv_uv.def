@@ -3,7 +3,8 @@ From: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime
 
 %post
     # Install ffmpeg for torchcodec/vllm multimodal support
-    apt-get update && apt-get install -y ffmpeg
+    # We use APT::Sandbox::User=root to avoid fakeroot privilege drop errors on HPC clusters
+    apt-get -o APT::Sandbox::User=root update && apt-get -o APT::Sandbox::User=root install -y ffmpeg
 
     # Install uv, an extremely fast Python package installer and resolver written in Rust
     pip install --break-system-packages uv
