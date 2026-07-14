@@ -9,7 +9,8 @@ From: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime
 
     # Install ffmpeg for torchcodec/vllm multimodal support
     # We use APT::Sandbox::User=root to avoid fakeroot privilege drop errors on HPC clusters
-    apt-get -o APT::Sandbox::User=root update && apt-get -o APT::Sandbox::User=root install -y ffmpeg
+    # We use --no-install-recommends to avoid pulling in GUI libraries like dbus/fontconfig which fail to configure in fakeroot
+    apt-get -o APT::Sandbox::User=root update && apt-get -o APT::Sandbox::User=root install -y --no-install-recommends ffmpeg
 
     # Remove bypasses
     rm /usr/local/bin/chown /usr/local/bin/chgrp /usr/local/bin/dpkg-statoverride
