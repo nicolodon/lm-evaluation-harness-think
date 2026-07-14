@@ -3,17 +3,21 @@ From: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime
 
 %post
     # Bypass broken chown/dpkg-statoverride in HPC fakeroot environments
-    ln -s /bin/true /usr/local/bin/chown
-    ln -s /bin/true /usr/local/bin/chgrp
-    ln -s /bin/true /usr/local/bin/dpkg-statoverride
+    # We must replace them in /usr/bin directly because apt-get ignores /usr/local/bin in secure paths
+    mv /usr/bin/dpkg-statoverride /usr/bin/dpkg-statoverride.bak
+    ln -s /bin/true /usr/bin/dpkg-statoverride
+    mv /usr/bin/chown /usr/bin/chown.bak
+    ln -s /bin/true /usr/bin/chown
 
     # Install ffmpeg for torchcodec/vllm multimodal support
     # We use APT::Sandbox::User=root to avoid fakeroot privilege drop errors on HPC clusters
-    # We use --no-install-recommends to avoid pulling in GUI libraries like dbus/fontconfig which fail to configure in fakeroot
+    # We use --no-install-recommends to minimize GUI dependencies
     apt-get -o APT::Sandbox::User=root update && apt-get -o APT::Sandbox::User=root install -y --no-install-recommends ffmpeg
 
-    # Remove bypasses
-    rm /usr/local/bin/chown /usr/local/bin/chgrp /usr/local/bin/dpkg-statoverride
+    # Restore bypasses
+    rm -f /usr/bin/dpkg-statoverride /usr/bin/chown
+    mv /usr/bin/dpkg-statoverride.bak /usr/bin/dpkg-statoverride
+    mv /usr/bin/chown.bak /usr/bin/chown
 
     # The PyTorch base image (Ubuntu) doesn't have python3-venv installed via apt.
     # Since we can't use apt-get, we install virtualenv via pip first to create the venv.
