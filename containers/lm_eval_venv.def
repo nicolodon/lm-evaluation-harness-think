@@ -2,9 +2,17 @@ Bootstrap: docker
 From: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime
 
 %post
+    # Bypass broken chown/dpkg-statoverride in HPC fakeroot environments
+    ln -s /bin/true /usr/local/bin/chown
+    ln -s /bin/true /usr/local/bin/chgrp
+    ln -s /bin/true /usr/local/bin/dpkg-statoverride
+
     # Install ffmpeg for torchcodec/vllm multimodal support
     # We use APT::Sandbox::User=root to avoid fakeroot privilege drop errors on HPC clusters
     apt-get -o APT::Sandbox::User=root update && apt-get -o APT::Sandbox::User=root install -y ffmpeg
+
+    # Remove bypasses
+    rm /usr/local/bin/chown /usr/local/bin/chgrp /usr/local/bin/dpkg-statoverride
 
     # The PyTorch base image (Ubuntu) doesn't have python3-venv installed via apt.
     # Since we can't use apt-get, we install virtualenv via pip first to create the venv.

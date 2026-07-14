@@ -2,9 +2,17 @@ Bootstrap: docker
 From: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime
 
 %post
+    # Bypass broken chown/dpkg-statoverride in HPC fakeroot environments
+    ln -s /bin/true /usr/local/bin/chown
+    ln -s /bin/true /usr/local/bin/chgrp
+    ln -s /bin/true /usr/local/bin/dpkg-statoverride
+
     # Install ffmpeg for torchcodec/vllm multimodal support
     # We use APT::Sandbox::User=root to avoid fakeroot privilege drop errors on HPC clusters
     apt-get -o APT::Sandbox::User=root update && apt-get -o APT::Sandbox::User=root install -y ffmpeg
+
+    # Remove bypasses
+    rm /usr/local/bin/chown /usr/local/bin/chgrp /usr/local/bin/dpkg-statoverride
 
     # Install uv, an extremely fast Python package installer and resolver written in Rust
     pip install --break-system-packages uv
