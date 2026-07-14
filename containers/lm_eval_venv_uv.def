@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-runtime
+From: pytorch/pytorch:2.11.0-cuda12.6-cudnn9-devel
 
 %post
     # Bypass broken chown/dpkg-statoverride in HPC fakeroot environments
