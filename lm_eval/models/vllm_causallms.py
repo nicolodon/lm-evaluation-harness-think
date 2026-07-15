@@ -111,6 +111,10 @@ class VLLM(TemplateLM):
                 "environment variable before running lm-eval."
             )
             kwargs.pop("device")
+        
+        if "device_map" in kwargs:
+            eval_logger.warning("The `device_map` argument is ignored by the vLLM backend.")
+            kwargs.pop("device_map")
         self.think_end_token = think_end_token
         self.think_start_token = think_start_token
         self._max_length = max_model_len if max_model_len is not None else max_length
